@@ -237,11 +237,12 @@ AGENT_NAMES = tuple(AGENTS.keys())
 
 def run_agent(name: str, task: str) -> str:
     """Run any agent by name."""
-    from config import MODEL_NAME, OLLAMA_BASE_URL, MAX_TOKENS
+    from config import MODEL_NAME, OLLAMA_BASE_URL, MAX_TOKENS, MCP_REQUEST_TIMEOUT
     agent = AGENTS[name]
     llm = ChatOllama(
         model=MODEL_NAME, base_url=OLLAMA_BASE_URL,
         temperature=agent["temperature"], num_predict=MAX_TOKENS,
+        timeout=MCP_REQUEST_TIMEOUT,
     )
     messages = [SystemMessage(content=agent["prompt"]), HumanMessage(content=task)]
     return llm.invoke(messages).content
