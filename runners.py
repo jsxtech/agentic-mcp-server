@@ -1,15 +1,32 @@
 """Agent execution modes — direct, chain, parallel, compare, stream, workflow."""
 
 import json
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from langchain_ollama import ChatOllama
-from langchain_core.messages import HumanMessage, SystemMessage
+logger = logging.getLogger(__name__)
 
 from agent_registry import AGENT_NAMES, run_agent
-from graph import build_agent_graph, AgentState
+from graph import build_agent_graph
 from session import ConversationHistory
+
+# Cache compiled graph — stateless and reusable across requests
+_cached_graph = None
+
+
+def _get_graph():
+    """Return the cached compiled graph, building it once on first use."""
+    global _cached_graph
+    if _cached_graph is None:
+        _cached_graph = build_agent_graph()
+    return _cached_graph
+
+
+def invalidate_graph_cache():
+    """Clear cached graph (call when config changes that affect graph structure)."""
+    global _cached_graph
+    _cached_graph = None
 
 WORKFLOWS = {
     "code_review": ["coder", "reviewer", "tester"],
@@ -67,11 +84,11 @@ WORKFLOWS = {
 
 def run_multi_agent(user_input: str, history: ConversationHistory = None) -> str:
     """Run the full supervisor orchestration."""
-    graph = build_agent_graph()
+    graph = _get_graph()
     context_input = user_input
     if history and history.turns:
         context_input = f"{history.get_context()}\n\nCurrent request: {user_input}"
-    initial_state: AgentState = {
+    initial_state = {
         "user_input": context_input, "agent_outputs": {}, "next_agent": "",
         "final_answer": "", "iteration": 0, "tool_calls": [], "available_tools": [],
     }
@@ -79,26 +96,40 @@ def run_multi_agent(user_input: str, history: ConversationHistory = None) -> str
 
 
 def run_direct(agent_name: str, task: str, history: ConversationHistory) -> str:
-    """Run a specific agent directly."""
+    """Run a specific agent directly.
+
+    Returns error string prefixed with ❌ for unknown agents.
+    """
     if agent_name not in AGENT_NAMES:
-        return f"❌ Unknown agent: '{agent_name}'"
+        return f"❌ Unknown agent: '{agent_name}'. Available: {', '.join(AGENT_NAMES[:5])}..."
     context = history.get_context()
     return run_agent(agent_name, f"{context}\n\n{task}" if context else task)
 
 
 def run_chain(chain: str, user_input: str, history: ConversationHistory) -> str:
-    """Run agents in sequence: 'coder|reviewer|tester'"""
+    """Run agents in sequence: 'coder|reviewer|tester'.
+
+    Returns error string prefixed with ❌ for unknown agents.
+    """
     agents = [a.strip() for a in chain.split("|")]
-    for name in agents:
-        if name not in AGENT_NAMES:
-            return f"❌ Unknown agent: '{name}'"
+    invalid = [name for name in agents if name not in AGENT_NAMES]
+    if invalid:
+        return f"❌ Unknown agent(s): {invalid}. Use /agents to see available agents."
 
     current_input = user_input
     context = history.get_context()
 
+    # Context window protection: limit how much of previous agent output
+    # is passed forward. For long chains (5+ agents), intermediate outputs
+    # can exceed the model's context window.
+    max_input_chars = 8000  # ~2000 tokens — leaves room for system prompt + response
+
     for i, name in enumerate(agents):
         print(f"  ⛓️  [{i+1}/{len(agents)}] Running {name}...")
         task = f"{context}\n\n{current_input}" if context else current_input
+        # Truncate if task exceeds context budget
+        if len(task) > max_input_chars:
+            task = task[:max_input_chars] + f"\n\n... [truncated — {len(task)} chars total, showing first {max_input_chars}]"
         current_input = run_agent(name, task)
         history.add_turn("assistant", current_input, agent=name)
 
@@ -107,6 +138,8 @@ def run_chain(chain: str, user_input: str, history: ConversationHistory) -> str:
 
 def run_parallel(agent_names: list[str], task: str, history: ConversationHistory) -> dict[str, str]:
     """Run multiple agents concurrently."""
+    if not agent_names:
+        return {}
     context = history.get_context()
     full_task = f"{context}\n\n{task}" if context else task
     results = {}
@@ -125,18 +158,24 @@ def run_parallel(agent_names: list[str], task: str, history: ConversationHistory
 
 
 def run_compare(agents_str: str, task: str, history: ConversationHistory) -> str:
-    """Run multiple agents on same task, format side-by-side."""
+    """Run multiple agents on same task, format side-by-side.
+
+    Returns error string prefixed with ❌ for unknown agents.
+    """
     agents = [a.strip() for a in agents_str.split(",")]
-    for name in agents:
-        if name not in AGENT_NAMES:
-            return f"❌ Unknown agent: '{name}'"
+    invalid = [name for name in agents if name not in AGENT_NAMES]
+    if invalid:
+        return f"❌ Unknown agent(s): {invalid}. Use /agents to see available agents."
 
     context = history.get_context()
     full_task = f"{context}\n\n{task}" if context else task
     lines = []
     for name in agents:
         print(f"  🔄 Running {name}...")
-        output = run_agent(name, full_task)
+        try:
+            output = run_agent(name, full_task)
+        except Exception as e:
+            output = f"[Error from {name}: {e}]"
         history.add_turn("assistant", output, agent=name)
         lines.append(f"━━━ {name.upper()} ━━━\n{output}\n")
     return "\n".join(lines)
@@ -151,8 +190,11 @@ def run_workflow(workflow_name: str, task: str, history: ConversationHistory) ->
 
 def run_streaming(user_input: str, history: ConversationHistory) -> str:
     """Stream a direct LLM response."""
-    from config import MODEL_NAME, OLLAMA_BASE_URL, MAX_TOKENS
-    llm = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0.2, num_predict=MAX_TOKENS)
+    from config import MODEL_NAME, OLLAMA_BASE_URL, MAX_TOKENS, MCP_REQUEST_TIMEOUT
+    from langchain_ollama import ChatOllama
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    llm = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0.2, num_predict=MAX_TOKENS, timeout=MCP_REQUEST_TIMEOUT)
     context = history.get_context()
     prompt = f"{context}\n\nUser request: {user_input}" if context else user_input
     messages = [
@@ -182,9 +224,14 @@ def load_file_context(file_path: str) -> str:
 # --- Batch Processing ---
 
 def run_batch(agent_name: str, tasks: list[str], history: ConversationHistory) -> list[str]:
-    """Run the same agent on multiple tasks."""
+    """Run the same agent on multiple tasks.
+
+    Returns a single-element list with error string for unknown agents or empty tasks.
+    """
     if agent_name not in AGENT_NAMES:
-        return [f"❌ Unknown agent: '{agent_name}'"]
+        return [f"❌ Unknown agent: '{agent_name}'. Use /agents to see available agents."]
+    if not tasks:
+        return [f"❌ No tasks provided."]
 
     results = []
     with ThreadPoolExecutor(max_workers=min(len(tasks), 4)) as pool:
@@ -203,34 +250,51 @@ def run_batch(agent_name: str, tasks: list[str], history: ConversationHistory) -
 # --- Conditional Workflow ---
 
 def run_conditional(task: str, history: ConversationHistory) -> str:
-    """Auto-select workflow based on task keywords."""
+    """Auto-select workflow based on task keywords using weighted scoring.
+
+    Uses multi-keyword matching with specificity weighting. Longer/more-specific
+    keywords score higher. Multiple keyword hits for the same workflow accumulate.
+    """
     task_lower = task.lower()
-    keyword_map = {
-        "bug": "bug_fix", "fix": "bug_fix", "error": "bug_fix",
-        "test": "code_review", "review": "code_review",
-        "deploy": "deploy", "ci/cd": "deploy", "pipeline": "deploy",
-        "api": "api_build", "endpoint": "api_build", "rest": "api_build",
-        "database": "db_design", "schema": "db_design", "sql": "db_design",
-        "security": "security_audit", "vulnerability": "security_audit",
-        "migrate": "migrate", "upgrade": "migrate",
-        "document": "docs", "readme": "docs",
-        "design": "design", "architect": "design",
-        "performance": "perf_audit", "slow": "perf_audit", "optimize": "optimize",
-        "frontend": "frontend", "ui": "frontend", "ux": "ux_audit",
-        "refactor": "refactor", "clean": "refactor",
-        "learn": "learn", "explain": "code_explain", "how": "learn",
-        "estimate": "estimate", "timeline": "estimate",
-        "scaffold": "scaffold", "boilerplate": "scaffold", "generate": "scaffold",
-        "ml": "ml_project", "machine learning": "ml_project", "model": "ml_project",
+
+    # Each workflow maps to a list of (keyword, weight) pairs.
+    # Multi-word keywords get higher weight (more specific).
+    # A keyword only matches as a whole word boundary to avoid false positives.
+    workflow_keywords: dict[str, list[tuple[str, int]]] = {
+        "bug_fix": [("bug", 3), ("fix", 2), ("error", 2), ("crash", 3), ("broken", 2), ("traceback", 3)],
+        "code_review": [("test", 1), ("review", 2), ("code review", 4)],
+        "deploy": [("deploy", 3), ("ci/cd", 4), ("pipeline", 2), ("kubernetes", 3), ("docker", 2)],
+        "api_build": [("api", 2), ("endpoint", 3), ("rest api", 4), ("graphql", 3)],
+        "db_design": [("database", 3), ("schema", 3), ("sql", 2), ("migration", 2), ("table", 1)],
+        "security_audit": [("security", 3), ("vulnerability", 4), ("exploit", 4), ("xss", 4), ("injection", 4)],
+        "migrate": [("migrate", 3), ("upgrade", 2), ("migration", 3)],
+        "docs": [("document", 2), ("readme", 3), ("documentation", 3), ("write docs", 4)],
+        "design": [("design", 2), ("architect", 3), ("system design", 4), ("architecture", 3)],
+        "perf_audit": [("performance", 3), ("slow", 2), ("latency", 3), ("bottleneck", 3)],
+        "optimize": [("optimize", 3), ("optimization", 3), ("faster", 2)],
+        "frontend": [("frontend", 3), ("ui", 2), ("react", 2), ("component", 1)],
+        "ux_audit": [("ux", 3), ("usability", 3), ("accessibility", 3), ("wcag", 4)],
+        "refactor": [("refactor", 3), ("clean up", 3), ("restructure", 3), ("technical debt", 4)],
+        "learn": [("learn", 2), ("explain", 2), ("how does", 3), ("tutorial", 3), ("teach", 2)],
+        "code_explain": [("explain this code", 5), ("what does this", 4), ("walk through", 4)],
+        "estimate": [("estimate", 3), ("timeline", 3), ("how long", 3), ("effort", 2)],
+        "scaffold": [("scaffold", 4), ("boilerplate", 4), ("generate", 2), ("starter", 2)],
+        "ml_project": [("machine learning", 5), ("ml pipeline", 5), ("train model", 4), ("neural", 3)],
     }
 
-    selected = None
-    for keyword, workflow in keyword_map.items():
-        if keyword in task_lower:
-            selected = workflow
-            break
+    # Score each workflow by summing weights of all matching keywords
+    scores: dict[str, int] = {}
+    for workflow, keywords in workflow_keywords.items():
+        score = 0
+        for keyword, weight in keywords:
+            if keyword in task_lower:
+                score += weight
+        if score > 0:
+            scores[workflow] = score
 
-    if not selected:
+    if scores:
+        selected = max(scores, key=scores.get)
+    else:
         selected = "full_dev"
 
     print(f"  🧠 Auto-selected workflow: {selected}")
@@ -242,14 +306,25 @@ def run_conditional(task: str, history: ConversationHistory) -> str:
 class AgentMemory:
     """Persistent memory that agents can reference across sessions."""
 
-    def __init__(self, path: Path = Path("sessions/memory.json")):
-        self._path = path
+    _PROJECT_ROOT = Path(__file__).parent
+
+    def __init__(self, path: Path = None):
+        self._path = path or (self._PROJECT_ROOT / "sessions" / "memory.json")
         self._data: dict[str, list[str]] = {}
         self._load()
 
     def _load(self):
         if self._path.exists():
-            self._data = json.loads(self._path.read_text())
+            try:
+                data = json.loads(self._path.read_text())
+                if isinstance(data, dict):
+                    self._data = data
+                else:
+                    logger.warning(f"Memory file has unexpected format, resetting: {self._path}")
+                    self._data = {}
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"Corrupted memory file, resetting: {self._path} ({e})")
+                self._data = {}
 
     def _save(self):
         self._path.parent.mkdir(exist_ok=True)
@@ -276,17 +351,26 @@ class AgentMemory:
 # --- Feedback Loop (iterative refinement) ---
 
 def run_feedback_loop(agent_name: str, task: str, reviewer_name: str, history: ConversationHistory, max_rounds: int = 3) -> str:
-    """Run agent, get review, iterate until approved or max rounds."""
-    if agent_name not in AGENT_NAMES or reviewer_name not in AGENT_NAMES:
-        return "❌ Unknown agent name"
+    """Run agent, get review, iterate until approved or max rounds.
+
+    Returns error string prefixed with ❌ for unknown agents.
+    """
+    invalid = [n for n in (agent_name, reviewer_name) if n not in AGENT_NAMES]
+    if invalid:
+        return f"❌ Unknown agent(s): {invalid}. Use /agents to see available agents."
 
     context = history.get_context()
     current_task = f"{context}\n\n{task}" if context else task
     result = ""
+    max_input_chars = 8000  # Context window protection
 
     for i in range(max_rounds):
         print(f"  🔄 Round {i+1}: {agent_name}...")
-        result = run_agent(agent_name, current_task)
+        # Truncate if accumulated context exceeds budget
+        agent_input = current_task
+        if len(agent_input) > max_input_chars:
+            agent_input = agent_input[:max_input_chars] + f"\n\n... [truncated for context window]"
+        result = run_agent(agent_name, agent_input)
         history.add_turn("assistant", result, agent=agent_name)
 
         print(f"  🔍 Round {i+1}: {reviewer_name} reviewing...")
@@ -307,15 +391,22 @@ def run_feedback_loop(agent_name: str, task: str, reviewer_name: str, history: C
 # --- Multi-File Context ---
 
 def load_multi_file_context(file_paths: list[str]) -> str:
-    """Load multiple files as context."""
+    """Load multiple files as context.
+
+    Skips files that don't exist with a warning marker inline.
+    This is intentionally lenient (vs raising) since partial context is still useful
+    when loading multiple files.
+    """
     parts = []
     for fp in file_paths:
         path = Path(fp.strip())
         if not path.exists():
-            parts.append(f"[File not found: {fp}]")
+            parts.append(f"[⚠️ File not found: {fp}]")
             continue
         content = path.read_text()
         if len(content) > 5000:
             content = content[:5000] + f"\n... (truncated, {len(content)} chars)"
         parts.append(f"### {path.name}\n```\n{content}\n```")
+    if not parts:
+        raise FileNotFoundError(f"None of the specified files exist: {file_paths}")
     return "\n\n".join(parts)
