@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-SESSIONS_DIR = Path("sessions")
+SESSIONS_DIR = Path(__file__).parent / "sessions"
 
 
 class ConversationHistory:
@@ -60,18 +60,25 @@ class TokenTracker:
 def save_session(history: ConversationHistory, name: str = None) -> str:
     SESSIONS_DIR.mkdir(exist_ok=True)
     name = name or datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Sanitize name to prevent path traversal
+    name = name.replace("/", "_").replace("\\", "_").replace("..", "_")
     path = SESSIONS_DIR / f"{name}.json"
     path.write_text(json.dumps(history.to_dict(), indent=2))
     return str(path)
 
 
 def load_session(name: str) -> ConversationHistory:
+    # Sanitize name to prevent path traversal
+    name = name.replace("/", "_").replace("\\", "_").replace("..", "_")
     path = SESSIONS_DIR / f"{name}.json"
     if not path.exists():
         path = SESSIONS_DIR / name
     if not path.exists():
         raise FileNotFoundError(f"Session not found: {name}")
-    return ConversationHistory.from_dict(json.loads(path.read_text()))
+    try:
+        return ConversationHistory.from_dict(json.loads(path.read_text()))
+    except (json.JSONDecodeError, KeyError) as e:
+        raise FileNotFoundError(f"Session file corrupted: {name} ({e})")
 
 
 def list_sessions() -> list[str]:
