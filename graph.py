@@ -8,7 +8,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 
 from agent_registry import run_agent, AGENT_NAMES
-from config import SUPERVISOR_SYSTEM_PROMPT, MODEL_NAME, OLLAMA_BASE_URL, MAX_TOKENS
+import config as _config
 
 
 class AgentState(TypedDict):
@@ -24,7 +24,10 @@ class AgentState(TypedDict):
 
 def supervisor_node(state: AgentState) -> AgentState:
     """Supervisor decides which agent to call next or finishes."""
-    llm = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0.2, num_predict=MAX_TOKENS)
+    llm = ChatOllama(
+        model=_config.MODEL_NAME, base_url=_config.OLLAMA_BASE_URL,
+        temperature=0.2, num_predict=_config.MAX_TOKENS, timeout=_config.MCP_REQUEST_TIMEOUT,
+    )
 
     context = f"User request: {state['user_input']}\n\n"
 
@@ -43,7 +46,7 @@ def supervisor_node(state: AgentState) -> AgentState:
         context += "No agents have been called yet. Decide which agent should handle this first."
 
     response = llm.invoke([
-        SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT),
+        SystemMessage(content=_config.SUPERVISOR_SYSTEM_PROMPT),
         HumanMessage(content=context),
     ])
 
@@ -65,7 +68,13 @@ def supervisor_node(state: AgentState) -> AgentState:
         state["final_answer"] = decision.get("final_answer", "Task completed.")
         state["next_agent"] = "FINISH"
     else:
-        state["next_agent"] = decision.get("next", "FINISH")
+        next_name = decision.get("next", "FINISH")
+        if next_name not in AGENT_NAMES:
+            # Supervisor hallucinated an invalid agent name — finish gracefully
+            state["final_answer"] = decision.get("reason", decision.get("final_answer", f"Unable to route: no agent named '{next_name}'."))
+            state["next_agent"] = "FINISH"
+        else:
+            state["next_agent"] = next_name
 
     state["iteration"] = state.get("iteration", 0) + 1
     return state
@@ -77,7 +86,10 @@ def _make_agent_node(agent_name: str):
         task = state["user_input"]
         if state["agent_outputs"]:
             task += f"\n\nContext from previous steps:\n{json.dumps(state['agent_outputs'], indent=2)}"
-        state["agent_outputs"][agent_name] = run_agent(agent_name, task)
+        try:
+            state["agent_outputs"][agent_name] = run_agent(agent_name, task)
+        except Exception as e:
+            state["agent_outputs"][agent_name] = f"[Agent '{agent_name}' failed: {e}]"
         return state
     return node
 
@@ -85,6 +97,14 @@ def _make_agent_node(agent_name: str):
 def route_from_supervisor(state: AgentState) -> str:
     """Route to the next agent based on supervisor's decision."""
     if state.get("iteration", 0) >= 5:
+        # Max iterations reached — ensure we have a final answer
+        if not state.get("final_answer"):
+            # Synthesize from the last agent output
+            if state["agent_outputs"]:
+                last_agent = list(state["agent_outputs"].keys())[-1]
+                state["final_answer"] = state["agent_outputs"][last_agent]
+            else:
+                state["final_answer"] = "Max iterations reached without producing a result."
         return "__end__"
     next_agent = state.get("next_agent", "FINISH")
     if next_agent in AGENT_NAMES:
