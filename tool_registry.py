@@ -2,6 +2,7 @@
 
 import logging
 import time
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 
 from mcp import ClientSession, StdioServerParameters
@@ -45,7 +46,7 @@ class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, RegisteredTool] = {}
         self._sessions: dict[str, ClientSession] = {}
-        self._contexts: list = []  # Keep references to prevent GC
+        self._exit_stack = AsyncExitStack()
 
     async def initialize(self, configs: list[ExternalServerConfig]) -> None:
         """Connect to all configured external MCP servers and discover tools."""
@@ -66,22 +67,28 @@ class ToolRegistry:
                 logger.warning(f"Failed to connect to '{config.name}': {e}")
 
     async def _connect(self, config: ExternalServerConfig) -> ClientSession:
-        """Establish connection to an external MCP server."""
+        """Establish connection to an external MCP server using managed exit stack."""
         if config.transport == "stdio":
             server_params = StdioServerParameters(
                 command=config.command,
                 args=config.args or [],
                 env=config.env,
             )
-            read_stream, write_stream = await stdio_client(server_params).__aenter__()
-            self._contexts.append((read_stream, write_stream))
-            session = await ClientSession(read_stream, write_stream).__aenter__()
+            read_stream, write_stream = await self._exit_stack.enter_async_context(
+                stdio_client(server_params)
+            )
+            session = await self._exit_stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
             await session.initialize()
             return session
         elif config.transport == "sse":
-            read_stream, write_stream = await sse_client(config.url).__aenter__()
-            self._contexts.append((read_stream, write_stream))
-            session = await ClientSession(read_stream, write_stream).__aenter__()
+            read_stream, write_stream = await self._exit_stack.enter_async_context(
+                sse_client(config.url)
+            )
+            session = await self._exit_stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
             await session.initialize()
             return session
         else:
@@ -133,12 +140,7 @@ class ToolRegistry:
             )
 
     async def shutdown(self) -> None:
-        """Close all external MCP server connections."""
-        for name, session in self._sessions.items():
-            try:
-                await session.__aexit__(None, None, None)
-            except Exception as e:
-                logger.warning(f"Error closing session '{name}': {e}")
+        """Close all external MCP server connections via the exit stack."""
+        await self._exit_stack.aclose()
         self._sessions.clear()
         self._tools.clear()
-        self._contexts.clear()
