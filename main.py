@@ -1,34 +1,35 @@
 """Main entry point for the multi-agent application."""
 
 import argparse
-import asyncio
 import logging
 import time
 
 import requests
 
 from agent_registry import AGENT_NAMES
-from config import MCP_SERVER_TRANSPORT, MCP_SSE_HOST, MCP_SSE_PORT, EXTERNAL_MCP_SERVERS, OLLAMA_BASE_URL, MODEL_NAME
+import config as _config
+from config import MCP_SERVER_TRANSPORT, MCP_SSE_HOST, MCP_SSE_PORT, EXTERNAL_MCP_SERVERS
 from session import ConversationHistory, TokenTracker, save_session, load_session, list_sessions, export_session
 from runners import (
     run_multi_agent, run_direct, run_chain, run_parallel,
     run_compare, run_workflow, run_streaming, load_file_context, WORKFLOWS,
     run_batch, run_conditional, AgentMemory, run_feedback_loop, load_multi_file_context,
+    invalidate_graph_cache,
 )
-from tool_registry import ToolRegistry, ExternalServerConfig
+from tool_registry import ExternalServerConfig
 
 
 def check_ollama_health() -> bool:
     try:
-        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+        resp = requests.get(f"{_config.OLLAMA_BASE_URL}/api/tags", timeout=5)
         if resp.status_code != 200:
             return False
         models = [m["name"] for m in resp.json().get("models", [])]
-        if not any(MODEL_NAME in m for m in models):
-            print(f"⚠️  Model '{MODEL_NAME}' not found. Available: {models}")
+        if not any(_config.MODEL_NAME in m for m in models):
+            print(f"⚠️  Model '{_config.MODEL_NAME}' not found. Available: {models}")
             return False
         return True
-    except requests.ConnectionError:
+    except (requests.ConnectionError, requests.Timeout, requests.JSONDecodeError, ValueError):
         return False
 
 
@@ -62,175 +63,350 @@ Commands:
 """
 
 
-def _handle_command(cmd: str, history: ConversationHistory, tracker: TokenTracker, memory: AgentMemory) -> bool:
-    """Handle a slash command. Returns True if handled."""
-    if cmd == "/help":
-        print(HELP)
-    elif cmd == "/agents":
-        for name in AGENT_NAMES: print(f"  • {name}")
-    elif cmd == "/health":
-        print("✅ OK" if check_ollama_health() else "❌ Not reachable")
-    elif cmd == "/history":
-        for t in (history.turns[-20:] or [{"content": "(empty)", "agent": None}]):
-            print(f"  [{t.get('agent','user')}] {t['content'][:100]}")
-    elif cmd == "/clear":
-        history.turns.clear(); print("  ✓ Cleared")
-    elif cmd == "/sessions":
-        for s in (list_sessions() or ["(none)"]): print(f"  • {s}")
-    elif cmd == "/tokens":
-        print(f"  {tracker.summary()}")
-    elif cmd == "/workflows":
-        for name, agents in WORKFLOWS.items(): print(f"  • {name}: {' → '.join(agents)}")
-    elif cmd == "/export":
-        print(f"  ✓ Exported to {export_session(history)}")
-    elif cmd.startswith("/save"):
-        print(f"  ✓ Saved to {save_session(history, cmd[5:].strip() or None)}")
-    elif cmd.startswith("/load "):
-        try:
-            history.turns = load_session(cmd[6:].strip()).turns
-            print(f"  ✓ Loaded ({len(history.turns)} turns)")
-        except FileNotFoundError as e:
-            print(f"  ❌ {e}")
-    elif cmd.startswith("/model "):
-        import config; config.MODEL_NAME = cmd[7:].strip()
-        print(f"  ✓ Switched to: {config.MODEL_NAME}")
-    elif cmd == "/retry":
-        last = history.last_user_message()
-        if not last: print("  ❌ No previous request"); return True
-        _run_and_print(last, history, tracker)
-    elif cmd.startswith("/ask "):
-        parts = cmd[5:].strip().split(" ", 1)
-        if len(parts) < 2: print("  Usage: /ask <agent> msg"); return True
-        name, msg = parts
-        history.add_turn("user", msg)
-        print(f"\n🤖 [{name}]...\n")
-        start = time.time()
-        result = run_direct(name, msg, history)
-        print(f"📋 ({time.time()-start:.1f}s):\n\n{result}")
-        history.add_turn("assistant", result, agent=name)
-        tracker.track(msg, result)
-    elif cmd.startswith("/chain "):
-        parts = cmd[7:].strip().split(" ", 1)
-        if len(parts) < 2: print("  Usage: /chain a|b|c msg"); return True
-        history.add_turn("user", parts[1]); print()
-        start = time.time()
-        result = run_chain(parts[0], parts[1], history)
-        print(f"\n📋 ({time.time()-start:.1f}s):\n\n{result}")
-        tracker.track(parts[1], result)
-    elif cmd.startswith("/compare "):
-        parts = cmd[9:].strip().split(" ", 1)
-        if len(parts) < 2: print("  Usage: /compare a,b msg"); return True
-        history.add_turn("user", parts[1]); print()
-        start = time.time()
-        result = run_compare(parts[0], parts[1], history)
-        print(f"\n📋 ({time.time()-start:.1f}s):\n\n{result}")
-        tracker.track(parts[1], result)
-    elif cmd.startswith("/parallel "):
-        parts = cmd[10:].strip().split(" ", 1)
-        if len(parts) < 2: print("  Usage: /parallel a,b msg"); return True
-        agent_list = [a.strip() for a in parts[0].split(",")]
-        invalid = [a for a in agent_list if a not in AGENT_NAMES]
-        if invalid: print(f"  ❌ Unknown: {invalid}"); return True
-        history.add_turn("user", parts[1]); print()
-        start = time.time()
-        results = run_parallel(agent_list, parts[1], history)
-        for name, output in results.items():
-            print(f"\n━━━ {name.upper()} ━━━\n{output}")
-            history.add_turn("assistant", output, agent=name)
-            tracker.track(parts[1], output)
-        print(f"\n  ⏱ {time.time()-start:.1f}s total")
-    elif cmd.startswith("/workflow "):
-        parts = cmd[10:].strip().split(" ", 1)
-        if len(parts) < 2: print("  Usage: /workflow <name> msg"); return True
-        history.add_turn("user", parts[1]); print()
-        start = time.time()
-        result = run_workflow(parts[0], parts[1], history)
-        print(f"\n📋 ({time.time()-start:.1f}s):\n\n{result}")
-        tracker.track(parts[1], result)
-    elif cmd.startswith("/file "):
-        parts = cmd[6:].strip().split(" ", 1)
-        if len(parts) < 2: print("  Usage: /file <path> msg"); return True
-        try:
-            ctx = load_file_context(parts[0])
-            full_msg = f"{ctx}\n\n{parts[1]}"
-            print(f"  📄 Loaded {parts[0]}")
-            _run_and_print(full_msg, history, tracker)
-        except FileNotFoundError as e:
-            print(f"  ❌ {e}")
-    elif cmd.startswith("/stream "):
-        msg = cmd[8:].strip()
-        history.add_turn("user", msg)
-        print("\n🤖 ", end="")
-        result = run_streaming(msg, history)
-        history.add_turn("assistant", result)
-        tracker.track(msg, result)
-    elif cmd.startswith("/auto "):
-        msg = cmd[6:].strip()
-        history.add_turn("user", msg); print()
-        start = time.time()
-        result = run_conditional(msg, history)
-        print(f"\n📋 ({time.time()-start:.1f}s):\n\n{result}")
-        tracker.track(msg, result)
-    elif cmd.startswith("/batch "):
-        parts = cmd[7:].strip().split(" ", 1)
-        if len(parts) < 2: print("  Usage: /batch <agent> task1;;task2;;task3"); return True
-        agent_name, tasks_str = parts
-        tasks = [t.strip() for t in tasks_str.split(";;") if t.strip()]
-        print(f"  Running {agent_name} on {len(tasks)} tasks...\n")
-        start = time.time()
-        results = run_batch(agent_name, tasks, history)
-        for i, r in enumerate(results):
-            print(f"━━━ Task {i+1} ━━━\n{r}\n")
+# --- Command Handlers ---
+# Each handler receives (args, history, tracker, memory) and returns True if handled.
+
+def _cmd_help(args, history, tracker, memory):
+    print(HELP)
+
+
+def _cmd_agents(args, history, tracker, memory):
+    for name in AGENT_NAMES:
+        print(f"  • {name}")
+
+
+def _cmd_health(args, history, tracker, memory):
+    print("✅ OK" if check_ollama_health() else "❌ Not reachable")
+
+
+def _cmd_history(args, history, tracker, memory):
+    for t in (history.turns[-20:] or [{"content": "(empty)", "agent": None}]):
+        print(f"  [{t.get('agent', 'user')}] {t['content'][:100]}")
+
+
+def _cmd_clear(args, history, tracker, memory):
+    history.turns.clear()
+    print("  ✓ Cleared")
+
+
+def _cmd_sessions(args, history, tracker, memory):
+    for s in (list_sessions() or ["(none)"]):
+        print(f"  • {s}")
+
+
+def _cmd_tokens(args, history, tracker, memory):
+    print(f"  {tracker.summary()}")
+
+
+def _cmd_workflows(args, history, tracker, memory):
+    for name, agents in WORKFLOWS.items():
+        print(f"  • {name}: {' → '.join(agents)}")
+
+
+def _cmd_export(args, history, tracker, memory):
+    print(f"  ✓ Exported to {export_session(history)}")
+
+
+def _cmd_save(args, history, tracker, memory):
+    print(f"  ✓ Saved to {save_session(history, args or None)}")
+
+
+def _cmd_load(args, history, tracker, memory):
+    if not args:
+        print("  Usage: /load <name>")
+        return
+    try:
+        history.turns = load_session(args).turns
+        print(f"  ✓ Loaded ({len(history.turns)} turns)")
+    except FileNotFoundError as e:
+        print(f"  ❌ {e}")
+
+
+def _cmd_model(args, history, tracker, memory):
+    if not args:
+        print("  Usage: /model <name>")
+        return
+    import config
+    config.MODEL_NAME = args
+    invalidate_graph_cache()
+    print(f"  ✓ Switched to: {config.MODEL_NAME}")
+
+
+def _cmd_retry(args, history, tracker, memory):
+    last = history.last_user_message()
+    if not last:
+        print("  ❌ No previous request")
+        return
+    # Don't re-add to history — it's already there. Just re-run and record the response.
+    print("\n🤖 Retrying...\n")
+    start = time.time()
+    result = run_multi_agent(last, history)
+    print(f"📋 Final Answer ({time.time()-start:.1f}s):\n\n{result}")
+    history.add_turn("assistant", result, agent="supervisor")
+    tracker.track(last, result)
+
+
+def _cmd_ask(args, history, tracker, memory):
+    parts = args.split(" ", 1) if args else []
+    if len(parts) < 2:
+        print("  Usage: /ask <agent> msg")
+        return
+    name, msg = parts
+    history.add_turn("user", msg)
+    print(f"\n🤖 [{name}]...\n")
+    start = time.time()
+    result = run_direct(name, msg, history)
+    print(f"📋 ({time.time()-start:.1f}s):\n\n{result}")
+    history.add_turn("assistant", result, agent=name)
+    tracker.track(msg, result)
+
+
+def _cmd_chain(args, history, tracker, memory):
+    parts = args.split(" ", 1) if args else []
+    if len(parts) < 2:
+        print("  Usage: /chain a|b|c msg")
+        return
+    history.add_turn("user", parts[1])
+    print()
+    start = time.time()
+    result = run_chain(parts[0], parts[1], history)
+    print(f"\n📋 ({time.time()-start:.1f}s):\n\n{result}")
+    tracker.track(parts[1], result)
+
+
+def _cmd_compare(args, history, tracker, memory):
+    parts = args.split(" ", 1) if args else []
+    if len(parts) < 2:
+        print("  Usage: /compare a,b msg")
+        return
+    history.add_turn("user", parts[1])
+    print()
+    start = time.time()
+    result = run_compare(parts[0], parts[1], history)
+    print(f"\n📋 ({time.time()-start:.1f}s):\n\n{result}")
+    tracker.track(parts[1], result)
+
+
+def _cmd_parallel(args, history, tracker, memory):
+    parts = args.split(" ", 1) if args else []
+    if len(parts) < 2:
+        print("  Usage: /parallel a,b msg")
+        return
+    agent_list = [a.strip() for a in parts[0].split(",")]
+    invalid = [a for a in agent_list if a not in AGENT_NAMES]
+    if invalid:
+        print(f"  ❌ Unknown: {invalid}")
+        return
+    history.add_turn("user", parts[1])
+    print()
+    start = time.time()
+    results = run_parallel(agent_list, parts[1], history)
+    for name, output in results.items():
+        print(f"\n━━━ {name.upper()} ━━━\n{output}")
+        history.add_turn("assistant", output, agent=name)
+        tracker.track(parts[1], output)
+    print(f"\n  ⏱ {time.time()-start:.1f}s total")
+
+
+def _cmd_workflow(args, history, tracker, memory):
+    parts = args.split(" ", 1) if args else []
+    if len(parts) < 2:
+        print("  Usage: /workflow <name> msg")
+        return
+    history.add_turn("user", parts[1])
+    print()
+    start = time.time()
+    result = run_workflow(parts[0], parts[1], history)
+    print(f"\n📋 ({time.time()-start:.1f}s):\n\n{result}")
+    tracker.track(parts[1], result)
+
+
+def _cmd_file(args, history, tracker, memory):
+    parts = args.split(" ", 1) if args else []
+    if len(parts) < 2:
+        print("  Usage: /file <path> msg")
+        return
+    try:
+        ctx = load_file_context(parts[0])
+        full_msg = f"{ctx}\n\n{parts[1]}"
+        print(f"  📄 Loaded {parts[0]}")
+        _run_and_print(full_msg, history, tracker)
+    except FileNotFoundError as e:
+        print(f"  ❌ {e}")
+
+
+def _cmd_stream(args, history, tracker, memory):
+    if not args:
+        print("  Usage: /stream msg")
+        return
+    history.add_turn("user", args)
+    print("\n🤖 ", end="")
+    result = run_streaming(args, history)
+    history.add_turn("assistant", result)
+    tracker.track(args, result)
+
+
+def _cmd_auto(args, history, tracker, memory):
+    if not args:
+        print("  Usage: /auto msg")
+        return
+    history.add_turn("user", args)
+    print()
+    start = time.time()
+    result = run_conditional(args, history)
+    print(f"\n📋 ({time.time()-start:.1f}s):\n\n{result}")
+    tracker.track(args, result)
+
+
+def _cmd_batch(args, history, tracker, memory):
+    parts = args.split(" ", 1) if args else []
+    if len(parts) < 2:
+        print("  Usage: /batch <agent> task1;;task2;;task3")
+        return
+    agent_name, tasks_str = parts
+    tasks = [t.strip() for t in tasks_str.split(";;") if t.strip()]
+    if not tasks:
+        print("  ❌ No tasks provided. Separate tasks with ;;")
+        return
+    print(f"  Running {agent_name} on {len(tasks)} tasks...\n")
+    start = time.time()
+    results = run_batch(agent_name, tasks, history)
+    for i, r in enumerate(results):
+        print(f"━━━ Task {i+1} ━━━\n{r}\n")
+        # Only track if we have a corresponding task (batch may return error list shorter than tasks)
+        if i < len(tasks):
             tracker.track(tasks[i], r)
-        print(f"  ⏱ {time.time()-start:.1f}s total")
-    elif cmd.startswith("/remember "):
-        parts = cmd[10:].strip().split(" ", 1)
-        if len(parts) < 2: print("  Usage: /remember <key> note"); return True
-        memory.add(parts[0], parts[1])
-        print(f"  ✓ Stored under '{parts[0]}'")
-    elif cmd.startswith("/recall"):
-        key = cmd[7:].strip() if len(cmd) > 7 else None
-        if key:
-            notes = memory.get(key)
-            if not notes: print(f"  (no notes for '{key}')"); return True
-            for n in notes: print(f"  • {n}")
-        else:
-            all_mem = memory.get_all()
-            if not all_mem: print("  (empty)"); return True
-            for k, notes in all_mem.items():
-                print(f"  [{k}] {len(notes)} notes")
-                for n in notes[:3]: print(f"    • {n}")
-    elif cmd.startswith("/forget"):
-        key = cmd[7:].strip() if len(cmd) > 7 else None
-        memory.clear(key)
-        print(f"  ✓ {'Cleared ' + key if key else 'All memory cleared'}")
-    elif cmd.startswith("/feedback "):
-        parts = cmd[10:].strip().split(" ", 2)
-        if len(parts) < 3: print("  Usage: /feedback <agent> <reviewer> message"); return True
-        agent_name, reviewer_name, msg = parts
-        history.add_turn("user", msg); print()
-        start = time.time()
-        result = run_feedback_loop(agent_name, msg, reviewer_name, history)
-        print(f"\n📋 ({time.time()-start:.1f}s):\n\n{result}")
-        tracker.track(msg, result)
-    elif cmd.startswith("/files "):
-        parts = cmd[7:].strip().split(" ", 1)
-        if len(parts) < 2: print("  Usage: /files path1,path2 message"); return True
-        file_paths = parts[0].split(",")
-        msg = parts[1]
-        ctx = load_multi_file_context(file_paths)
-        full_msg = f"{ctx}\n\n{msg}"
-        print(f"  📄 Loaded {len(file_paths)} files")
-        history.add_turn("user", full_msg)
-        print("\n🤖 Processing...\n")
-        start = time.time()
-        result = run_multi_agent(full_msg, history)
-        print(f"📋 ({time.time()-start:.1f}s):\n\n{result}")
-        history.add_turn("assistant", result, agent="supervisor")
-        tracker.track(full_msg, result)
+    print(f"  ⏱ {time.time()-start:.1f}s total")
+
+
+def _cmd_remember(args, history, tracker, memory):
+    parts = args.split(" ", 1) if args else []
+    if len(parts) < 2:
+        print("  Usage: /remember <key> note")
+        return
+    memory.add(parts[0], parts[1])
+    print(f"  ✓ Stored under '{parts[0]}'")
+
+
+def _cmd_recall(args, history, tracker, memory):
+    key = args if args else None
+    if key:
+        notes = memory.get(key)
+        if not notes:
+            print(f"  (no notes for '{key}')")
+            return
+        for n in notes:
+            print(f"  • {n}")
     else:
-        return False
-    return True
+        all_mem = memory.get_all()
+        if not all_mem:
+            print("  (empty)")
+            return
+        for k, notes in all_mem.items():
+            print(f"  [{k}] {len(notes)} notes")
+            for n in notes[:3]:
+                print(f"    • {n}")
+
+
+def _cmd_forget(args, history, tracker, memory):
+    key = args if args else None
+    memory.clear(key)
+    print(f"  ✓ {'Cleared ' + key if key else 'All memory cleared'}")
+
+
+def _cmd_feedback(args, history, tracker, memory):
+    parts = args.split(" ", 2) if args else []
+    if len(parts) < 3:
+        print("  Usage: /feedback <agent> <reviewer> message")
+        return
+    agent_name, reviewer_name, msg = parts
+    history.add_turn("user", msg)
+    print()
+    start = time.time()
+    result = run_feedback_loop(agent_name, msg, reviewer_name, history)
+    print(f"\n📋 ({time.time()-start:.1f}s):\n\n{result}")
+    tracker.track(msg, result)
+
+
+def _cmd_files(args, history, tracker, memory):
+    parts = args.split(" ", 1) if args else []
+    if len(parts) < 2:
+        print("  Usage: /files path1,path2 message")
+        return
+    file_paths = parts[0].split(",")
+    msg = parts[1]
+    try:
+        ctx = load_multi_file_context(file_paths)
+    except FileNotFoundError as e:
+        print(f"  ❌ {e}")
+        return
+    full_msg = f"{ctx}\n\n{msg}"
+    print(f"  📄 Loaded {len(file_paths)} files")
+    history.add_turn("user", full_msg)
+    print("\n🤖 Processing...\n")
+    start = time.time()
+    result = run_multi_agent(full_msg, history)
+    print(f"📋 ({time.time()-start:.1f}s):\n\n{result}")
+    history.add_turn("assistant", result, agent="supervisor")
+    tracker.track(full_msg, result)
+
+
+# --- Command Registry ---
+# Maps command name to (handler, takes_args). Prefix-matched commands (like /save, /load)
+# are handled by matching the longest prefix.
+
+COMMANDS = {
+    "/help": _cmd_help,
+    "/agents": _cmd_agents,
+    "/health": _cmd_health,
+    "/history": _cmd_history,
+    "/clear": _cmd_clear,
+    "/sessions": _cmd_sessions,
+    "/tokens": _cmd_tokens,
+    "/workflows": _cmd_workflows,
+    "/export": _cmd_export,
+    "/save": _cmd_save,
+    "/load": _cmd_load,
+    "/model": _cmd_model,
+    "/retry": _cmd_retry,
+    "/ask": _cmd_ask,
+    "/chain": _cmd_chain,
+    "/compare": _cmd_compare,
+    "/parallel": _cmd_parallel,
+    "/workflow": _cmd_workflow,
+    "/file": _cmd_file,
+    "/stream": _cmd_stream,
+    "/auto": _cmd_auto,
+    "/batch": _cmd_batch,
+    "/remember": _cmd_remember,
+    "/recall": _cmd_recall,
+    "/forget": _cmd_forget,
+    "/feedback": _cmd_feedback,
+    "/files": _cmd_files,
+}
+
+
+def _handle_command(cmd: str, history: ConversationHistory, tracker: TokenTracker, memory: AgentMemory) -> bool:
+    """Handle a slash command using the command registry. Returns True if handled."""
+    # Split into command name and args
+    parts = cmd.split(" ", 1)
+    cmd_name = parts[0]
+    args = parts[1].strip() if len(parts) > 1 else ""
+
+    # Exact match first (e.g., /help, /agents)
+    if cmd_name in COMMANDS:
+        COMMANDS[cmd_name](args, history, tracker, memory)
+        return True
+
+    # Prefix match for commands that share prefixes (e.g., /file vs /files)
+    # Sort by length descending to match longest prefix first
+    for registered_cmd in sorted(COMMANDS.keys(), key=len, reverse=True):
+        if cmd.startswith(registered_cmd):
+            remaining = cmd[len(registered_cmd):].strip()
+            COMMANDS[registered_cmd](remaining, history, tracker, memory)
+            return True
+
+    return False
 
 
 def _run_and_print(user_input: str, history: ConversationHistory, tracker: TokenTracker):
@@ -247,12 +423,12 @@ def _run_and_print(user_input: str, history: ConversationHistory, tracker: Token
 def run_cli():
     print("=" * 60)
     print("  Multi-Agent AI System (Local LLM via Ollama)")
-    print(f"  Model: {MODEL_NAME} | Agents: {len(AGENT_NAMES)}")
+    print(f"  Model: {_config.MODEL_NAME} | Agents: {len(AGENT_NAMES)}")
     print("=" * 60)
     print("  Type /help for commands\n")
 
     if check_ollama_health():
-        print(f"✅ Ollama running, model '{MODEL_NAME}' available\n")
+        print(f"✅ Ollama running, model '{_config.MODEL_NAME}' available\n")
     else:
         print(f"⚠️  Ollama not reachable. Start with: ollama serve\n")
 
@@ -264,12 +440,14 @@ def run_cli():
         try:
             user_input = input("🧑 You: ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nGoodbye!"); break
+            print("\nGoodbye!")
+            break
 
         if not user_input:
             continue
         if user_input.lower() in ("quit", "exit"):
-            print("Goodbye!"); break
+            print("Goodbye!")
+            break
         if user_input.startswith("/"):
             if _handle_command(user_input, history, tracker, memory):
                 continue
@@ -282,10 +460,11 @@ def run_cli():
 
 
 def run_mcp_server(transport: str, host: str, port: int):
-    from mcp_server import start_server
+    from mcp_server import start_server, set_tool_registry
     if EXTERNAL_MCP_SERVERS:
-        registry = ToolRegistry()
-        asyncio.run(registry.initialize([ExternalServerConfig(**c) for c in EXTERNAL_MCP_SERVERS]))
+        # Pass configs to the MCP server module for lifecycle-managed initialization.
+        # The registry must be initialized in the same event loop as the server.
+        set_tool_registry([ExternalServerConfig(**c) for c in EXTERNAL_MCP_SERVERS])
     start_server(transport=transport, host=host, port=port)
 
 
