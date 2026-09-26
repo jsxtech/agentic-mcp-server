@@ -120,7 +120,7 @@ class ToolRegistry:
         except (ToolNotFoundError, ToolExecutionError):
             raise
         except Exception as e:
-            raise ToolExecutionError(f"Failed to call tool '{tool_name}': {e}")
+            raise ToolExecutionError(f"Failed to call tool '{tool_name}': {e}") from e
 
     async def refresh(self, server_name: str) -> None:
         """Re-discover tools from a specific external server."""
