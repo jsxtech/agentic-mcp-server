@@ -5,12 +5,18 @@ import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 from agent_registry import AGENT_NAMES, run_agent
 from graph import build_agent_graph
 from session import ConversationHistory
+
+# Context-window protection: cap how much accumulated input is fed to an agent
+# in sequential/iterative modes (chains, feedback loops). ~2000 tokens, leaving
+# room for the system prompt and the model's response.
+MAX_INPUT_CHARS = 8000
 
 # Cache compiled graph — stateless and reusable across requests
 _cached_graph = None
@@ -83,7 +89,7 @@ WORKFLOWS = {
 }
 
 
-def run_multi_agent(user_input: str, history: ConversationHistory = None) -> str:
+def run_multi_agent(user_input: str, history: Optional[ConversationHistory] = None) -> str:
     """Run the full supervisor orchestration."""
     graph = _get_graph()
     context_input = user_input
@@ -123,14 +129,12 @@ def run_chain(chain: str, user_input: str, history: ConversationHistory) -> str:
     # Context window protection: limit how much of previous agent output
     # is passed forward. For long chains (5+ agents), intermediate outputs
     # can exceed the model's context window.
-    max_input_chars = 8000  # ~2000 tokens — leaves room for system prompt + response
-
     for i, name in enumerate(agents):
         print(f"  ⛓️  [{i+1}/{len(agents)}] Running {name}...")
         task = f"{context}\n\n{current_input}" if context else current_input
         # Truncate if task exceeds context budget
-        if len(task) > max_input_chars:
-            task = task[:max_input_chars] + f"\n\n... [truncated — {len(task)} chars total, showing first {max_input_chars}]"
+        if len(task) > MAX_INPUT_CHARS:
+            task = task[:MAX_INPUT_CHARS] + f"\n\n... [truncated — {len(task)} chars total, showing first {MAX_INPUT_CHARS}]"
         current_input = run_agent(name, task)
         history.add_turn("assistant", current_input, agent=name)
 
@@ -344,7 +348,9 @@ class AgentMemory:
         return self._data.get(key, [])
 
     def get_all(self) -> dict[str, list[str]]:
-        return self._data
+        # Return a deep-ish copy so callers can't mutate internal state without
+        # going through add()/clear() (which persist to disk).
+        return {k: list(v) for k, v in self._data.items()}
 
     def clear(self, key: str = None):
         if key:
@@ -355,6 +361,30 @@ class AgentMemory:
 
 
 # --- Feedback Loop (iterative refinement) ---
+
+def _is_approved(review: str) -> bool:
+    """Decide whether a reviewer response signals approval.
+
+    Robust against:
+      - incidental mentions of the word "approved" in the reviewed content;
+      - negations like "NOT APPROVED" / "UNAPPROVED" / "not approved".
+    Prefers the explicit ``VERDICT: APPROVED`` sentinel the reviewer is asked to
+    emit, but falls back to a negation-aware whole-word check for models that
+    don't follow the format exactly.
+    """
+    up = review.upper()
+    # Explicit verdict line wins.
+    if re.search(r"VERDICT:\s*APPROVED\b", up):
+        return True
+    if re.search(r"VERDICT:\s*REVISE\b", up):
+        return False
+    # Fallback: whole-word APPROVED not immediately negated.
+    if re.search(r"\bUNAPPROVED\b", up):
+        return False
+    if re.search(r"\bNOT\s+APPROVED\b", up):
+        return False
+    return re.search(r"\bAPPROVED\b", up) is not None
+
 
 def run_feedback_loop(agent_name: str, task: str, reviewer_name: str, history: ConversationHistory, max_rounds: int = 3) -> str:
     """Run agent, get review, iterate until approved or max rounds.
@@ -368,22 +398,27 @@ def run_feedback_loop(agent_name: str, task: str, reviewer_name: str, history: C
     context = history.get_context()
     current_task = f"{context}\n\n{task}" if context else task
     result = ""
-    max_input_chars = 8000  # Context window protection
 
     for i in range(max_rounds):
         print(f"  🔄 Round {i+1}: {agent_name}...")
         # Truncate if accumulated context exceeds budget
         agent_input = current_task
-        if len(agent_input) > max_input_chars:
-            agent_input = agent_input[:max_input_chars] + f"\n\n... [truncated for context window]"
+        if len(agent_input) > MAX_INPUT_CHARS:
+            agent_input = agent_input[:MAX_INPUT_CHARS] + "\n\n... [truncated for context window]"
         result = run_agent(agent_name, agent_input)
         history.add_turn("assistant", result, agent=agent_name)
 
         print(f"  🔍 Round {i+1}: {reviewer_name} reviewing...")
-        review = run_agent(reviewer_name, f"Review this output and say APPROVED if it's good, or provide specific feedback for improvement:\n\n{result}")
+        review = run_agent(
+            reviewer_name,
+            "Review the following output. Respond with a final line exactly "
+            '"VERDICT: APPROVED" if it is good enough to ship, otherwise a final line '
+            '"VERDICT: REVISE" followed by specific feedback for improvement:\n\n'
+            f"{result}",
+        )
         history.add_turn("assistant", review, agent=reviewer_name)
 
-        if "APPROVED" in review.upper():
+        if _is_approved(review):
             print(f"  ✅ Approved after {i+1} round(s)")
             return result
 
