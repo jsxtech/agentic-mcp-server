@@ -6,7 +6,7 @@ import logging
 
 from mcp.server.fastmcp import FastMCP
 
-from config import MCP_SERVER_NAME, MODEL_NAME, OLLAMA_BASE_URL, TEMPERATURE, MAX_TOKENS
+from config import MCP_SERVER_NAME, MODEL_NAME, OLLAMA_BASE_URL, TEMPERATURE, MAX_TOKENS, MCP_REQUEST_TIMEOUT
 from agent_registry import AGENTS, run_agent
 from graph import build_agent_graph, AgentState
 from tool_registry import ToolRegistry, ExternalServerConfig
@@ -15,7 +15,10 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP(MCP_SERVER_NAME)
 
-# Cache compiled graph — it's stateless and reusable across requests
+# Cache compiled graph — it's stateless and reusable across requests.
+# Note: this graph is built with a tool_executor bound to the server's event loop,
+# so it is distinct from the CLI graph cache in runners.py (which has no external
+# tools). The two caches intentionally differ; they are never used in the same process.
 _cached_graph = None
 
 # External tool registry — lazy-initialized on first use within the server's event loop
@@ -23,13 +26,10 @@ _tool_registry: ToolRegistry | None = None
 _registry_initialized = False
 _external_server_configs: list[ExternalServerConfig] | None = None
 
-
-def _get_graph():
-    """Return the cached compiled graph, building it once on first use."""
-    global _cached_graph
-    if _cached_graph is None:
-        _cached_graph = build_agent_graph()
-    return _cached_graph
+# The event loop running the FastMCP server. Captured on first tool call so that
+# synchronous graph nodes (offloaded to worker threads) can call back into async
+# tool sessions that live on this loop.
+_server_loop: asyncio.AbstractEventLoop | None = None
 
 
 def set_tool_registry(configs: list[ExternalServerConfig]):
@@ -40,14 +40,55 @@ def set_tool_registry(configs: list[ExternalServerConfig]):
 
 async def _ensure_registry():
     """Lazy-initialize tool registry within the current event loop on first use."""
-    global _tool_registry, _registry_initialized
+    global _tool_registry, _registry_initialized, _server_loop
     if _registry_initialized:
         return
     _registry_initialized = True
+    _server_loop = asyncio.get_running_loop()
     if _external_server_configs:
         _tool_registry = ToolRegistry()
         await _tool_registry.initialize(_external_server_configs)
         logger.info(f"Tool registry initialized: {len(await _tool_registry.list_tools())} external tools")
+
+
+def _sync_tool_executor(tool_name: str, arguments: dict) -> str:
+    """Synchronous bridge to execute an async external MCP tool from a worker thread.
+
+    Graph nodes run synchronously inside ``asyncio.to_thread``. The external MCP
+    sessions live on the server's event loop, so we schedule the coroutine there
+    and block for the result.
+    """
+    if _tool_registry is None or _server_loop is None:
+        raise RuntimeError("Tool registry is not initialized")
+    future = asyncio.run_coroutine_threadsafe(
+        _tool_registry.call_tool(tool_name, arguments), _server_loop
+    )
+    return future.result(timeout=MCP_REQUEST_TIMEOUT)
+
+
+async def _get_graph():
+    """Return the cached compiled graph, building it once on first use.
+
+    Ensures the tool registry is initialized first so the graph can be built with a
+    tool_executor when external servers are configured.
+    """
+    global _cached_graph
+    await _ensure_registry()
+    if _cached_graph is None:
+        tool_executor = _sync_tool_executor if _tool_registry is not None else None
+        _cached_graph = build_agent_graph(tool_executor=tool_executor)
+    return _cached_graph
+
+
+async def _discover_tools() -> list[dict]:
+    """Return metadata for all discovered external tools (name/description/schema)."""
+    if _tool_registry is None:
+        return []
+    tools = await _tool_registry.list_tools()
+    return [
+        {"name": t.name, "description": t.description, "input_schema": t.input_schema}
+        for t in tools
+    ]
 
 
 @mcp.tool()
@@ -60,8 +101,8 @@ async def run_multi_agent(query: str) -> str:
     Returns:
         The final synthesized answer from the agent orchestration.
     """
-    await _ensure_registry()
-    graph = _get_graph()
+    graph = await _get_graph()
+    available_tools = await _discover_tools()
     initial_state: AgentState = {
         "user_input": query,
         "agent_outputs": {},
@@ -69,7 +110,9 @@ async def run_multi_agent(query: str) -> str:
         "final_answer": "",
         "iteration": 0,
         "tool_calls": [],
-        "available_tools": [],
+        "available_tools": available_tools,
+        "pending_tool": "",
+        "pending_args": {},
     }
     # graph.invoke() is blocking (calls Ollama HTTP) — run in thread to avoid blocking the event loop
     final_state = await asyncio.to_thread(graph.invoke, initial_state)
