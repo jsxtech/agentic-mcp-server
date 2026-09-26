@@ -14,7 +14,6 @@ MCP_SERVER_TRANSPORT = "stdio"
 MCP_SSE_HOST = "0.0.0.0"
 MCP_SSE_PORT = 8080
 MCP_REQUEST_TIMEOUT = 300
-MCP_SHUTDOWN_TIMEOUT = 30
 
 # External MCP server configurations
 EXTERNAL_MCP_SERVERS: list[dict] = []
