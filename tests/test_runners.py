@@ -212,6 +212,13 @@ class TestFileContext:
         with pytest.raises(FileNotFoundError):
             load_file_context("/no/such/file.xyz")
 
+    def test_load_file_non_utf8_does_not_crash(self, tmp_path):
+        # Regression: binary / invalid-UTF8 content must not raise UnicodeDecodeError.
+        f = tmp_path / "blob.bin"
+        f.write_bytes(b"\xff\xfe valid-ish \x80\x81 text")
+        ctx = load_file_context(str(f))
+        assert "blob.bin" in ctx
+
     def test_load_file_truncates(self, tmp_path):
         f = tmp_path / "big.txt"
         f.write_text("z" * 20000)
@@ -263,6 +270,13 @@ class TestAgentMemory:
         mem.add("b", "2")
         mem.clear()
         assert mem.get_all() == {}
+
+    def test_nested_parent_dirs_created(self, tmp_path):
+        # Regression: _save must create intermediate directories, not crash.
+        mem = AgentMemory(path=tmp_path / "deep" / "nested" / "mem.json")
+        mem.add("k", "v")
+        assert (tmp_path / "deep" / "nested" / "mem.json").exists()
+        assert AgentMemory(path=tmp_path / "deep" / "nested" / "mem.json").get("k") == ["v"]
 
 
 class TestGraphCache:

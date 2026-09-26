@@ -216,7 +216,7 @@ def load_file_context(file_path: str) -> str:
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {file_path}")
-    content = path.read_text()
+    content = path.read_text(encoding="utf-8", errors="replace")
     if len(content) > 10000:
         content = content[:10000] + f"\n\n... (truncated, {len(content)} chars total)"
     return f"File: {path.name}\n```\n{content}\n```"
@@ -333,7 +333,7 @@ class AgentMemory:
                 self._data = {}
 
     def _save(self):
-        self._path.parent.mkdir(exist_ok=True)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
         self._path.write_text(json.dumps(self._data, indent=2))
 
     def add(self, key: str, note: str):
@@ -409,7 +409,7 @@ def load_multi_file_context(file_paths: list[str]) -> str:
         if not path.exists():
             parts.append(f"[⚠️ File not found: {fp}]")
             continue
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8", errors="replace")
         if len(content) > 5000:
             content = content[:5000] + f"\n... (truncated, {len(content)} chars)"
         parts.append(f"### {path.name}\n```\n{content}\n```")
