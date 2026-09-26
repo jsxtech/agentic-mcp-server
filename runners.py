@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -231,7 +232,7 @@ def run_batch(agent_name: str, tasks: list[str], history: ConversationHistory) -
     if agent_name not in AGENT_NAMES:
         return [f"❌ Unknown agent: '{agent_name}'. Use /agents to see available agents."]
     if not tasks:
-        return [f"❌ No tasks provided."]
+        return ["❌ No tasks provided."]
 
     results = []
     with ThreadPoolExecutor(max_workers=min(len(tasks), 4)) as pool:
@@ -282,12 +283,17 @@ def run_conditional(task: str, history: ConversationHistory) -> str:
         "ml_project": [("machine learning", 5), ("ml pipeline", 5), ("train model", 4), ("neural", 3)],
     }
 
-    # Score each workflow by summing weights of all matching keywords
+    # Score each workflow by summing weights of all matching keywords.
+    # Match on word boundaries so short keywords like "ui"/"ml"/"ux" don't
+    # produce false positives inside unrelated words (e.g. "build", "html").
+    def _matches(keyword: str) -> bool:
+        return re.search(rf"\b{re.escape(keyword)}\b", task_lower) is not None
+
     scores: dict[str, int] = {}
     for workflow, keywords in workflow_keywords.items():
         score = 0
         for keyword, weight in keywords:
-            if keyword in task_lower:
+            if _matches(keyword):
                 score += weight
         if score > 0:
             scores[workflow] = score
