@@ -102,7 +102,6 @@ class TestBatchTracking:
 
     def test_error_sentinel_not_mistracked(self, monkeypatch):
         # Unknown agent -> run_batch returns a 1-element ❌ list while tasks has 3.
-        import runners
         h = ConversationHistory()
         tracker = TokenTracker()
         main._cmd_batch("bogus_agent t1;;t2;;t3", h, tracker, _FakeMemory())

@@ -12,7 +12,6 @@ from graph import (
     build_agent_graph,
     USE_TOOL,
     TOOL_NODE,
-    MAX_CONTEXT_CHARS,
     MAX_TOOL_RESULT_CHARS,
 )
 
