@@ -78,7 +78,7 @@ def load_session(name: str) -> ConversationHistory:
     try:
         return ConversationHistory.from_dict(json.loads(path.read_text()))
     except (json.JSONDecodeError, KeyError) as e:
-        raise FileNotFoundError(f"Session file corrupted: {name} ({e})")
+        raise FileNotFoundError(f"Session file corrupted: {name} ({e})") from e
 
 
 def list_sessions() -> list[str]:
