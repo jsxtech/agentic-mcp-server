@@ -80,7 +80,7 @@ ollama list
 ### Step 4: Set Up the Application
 
 ```bash
-cd multi-agent-app
+cd agentic-mcp-server
 
 # Create Python virtual environment
 python3 -m venv .venv
@@ -209,6 +209,14 @@ Options:
 
 Your agents can consume tools from OTHER local MCP servers running on your machine.
 
+> **How it works:** When `EXTERNAL_MCP_SERVERS` is configured and you run the app as an MCP
+> server (`python main.py --mcp-server`), the tool registry connects to each configured server
+> and discovers its tools. During `run_multi_agent` orchestration, the discovered tools are
+> exposed to the supervisor, which may route to an external tool (instead of an agent) by
+> emitting `{"next": "use_tool", "tool": "<name>", "args": {...}}`. The tool result is fed
+> back into the orchestration loop. External tool consumption is only active in MCP-server mode;
+> the interactive CLI does not connect to external servers.
+
 ### Install Local MCP Servers
 
 ```bash
@@ -306,7 +314,7 @@ EXTERNAL_MCP_SERVERS = [
 ollama serve
 
 # Terminal 2: Run the app
-cd multi-agent-app
+cd agentic-mcp-server
 source .venv/bin/activate
 python main.py
 ```
@@ -624,8 +632,8 @@ Add to `~/.config/claude/claude_desktop_config.json` (Linux) or `~/Library/Appli
 {
   "mcpServers": {
     "multi-agent": {
-      "command": "/home/jaspal/jscode/js-ai-apps-api/multi-agent-app/.venv/bin/python",
-      "args": ["/home/jaspal/jscode/js-ai-apps-api/multi-agent-app/main.py", "--mcp-server"]
+      "command": "/home/jaspal/jscode/jsxtech/agentic-mcp-server/.venv/bin/python",
+      "args": ["/home/jaspal/jscode/jsxtech/agentic-mcp-server/main.py", "--mcp-server"]
     }
   }
 }
@@ -637,9 +645,9 @@ Add to Cursor MCP settings:
 ```json
 {
   "multi-agent": {
-    "command": "/home/jaspal/jscode/js-ai-apps-api/multi-agent-app/.venv/bin/python",
+    "command": "/home/jaspal/jscode/jsxtech/agentic-mcp-server/.venv/bin/python",
     "args": ["main.py", "--mcp-server"],
-    "cwd": "/home/jaspal/jscode/js-ai-apps-api/multi-agent-app"
+    "cwd": "/home/jaspal/jscode/jsxtech/agentic-mcp-server"
   }
 }
 ```
@@ -653,7 +661,7 @@ Add to Cursor MCP settings:
       "multi-agent": {
         "command": "python",
         "args": ["main.py", "--mcp-server"],
-        "cwd": "/home/jaspal/jscode/js-ai-apps-api/multi-agent-app"
+        "cwd": "/home/jaspal/jscode/jsxtech/agentic-mcp-server"
       }
     }
   }
@@ -765,7 +773,7 @@ export OLLAMA_KEEP_ALIVE=5m         # Model keep-alive time
 ## Project Structure
 
 ```
-multi-agent-app/
+agentic-mcp-server/
 ├── agent_registry.py   # 45 agent definitions (single source of truth)
 ├── config.py           # All settings + supervisor prompt
 ├── graph.py            # LangGraph supervisor orchestration
