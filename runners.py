@@ -7,11 +7,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
-logger = logging.getLogger(__name__)
-
 from agent_registry import AGENT_NAMES, run_agent
 from graph import build_agent_graph
 from session import ConversationHistory
+
+logger = logging.getLogger(__name__)
 
 # Context-window protection: cap how much accumulated input is fed to an agent
 # in sequential/iterative modes (chains, feedback loops). ~2000 tokens, leaving
@@ -302,10 +302,7 @@ def run_conditional(task: str, history: ConversationHistory) -> str:
         if score > 0:
             scores[workflow] = score
 
-    if scores:
-        selected = max(scores, key=scores.get)
-    else:
-        selected = "full_dev"
+    selected = max(scores, key=scores.get) if scores else "full_dev"
 
     print(f"  🧠 Auto-selected workflow: {selected}")
     return run_workflow(selected, task, history)

@@ -434,9 +434,8 @@ def _process_input(user_input: str, history: ConversationHistory, tracker: Token
         return False
 
     try:
-        if user_input.startswith("/"):
-            if _handle_command(user_input, history, tracker, memory):
-                return True
+        if user_input.startswith("/") and _handle_command(user_input, history, tracker, memory):
+            return True
         # Normal multi-agent flow (also reached for a "/" input that isn't a command)
         _run_and_print(user_input, history, tracker)
     except Exception as e:
@@ -454,7 +453,7 @@ def run_cli():
     if check_ollama_health():
         print(f"✅ Ollama running, model '{_config.MODEL_NAME}' available\n")
     else:
-        print(f"⚠️  Ollama not reachable. Start with: ollama serve\n")
+        print("⚠️  Ollama not reachable. Start with: ollama serve\n")
 
     history = ConversationHistory()
     tracker = TokenTracker()
