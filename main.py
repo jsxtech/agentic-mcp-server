@@ -204,7 +204,9 @@ def _cmd_parallel(args, history, tracker, memory):
     for name, output in results.items():
         print(f"\n━━━ {name.upper()} ━━━\n{output}")
         history.add_turn("assistant", output, agent=name)
-        tracker.track(parts[1], output)
+    # Track the shared input once (not once per agent) plus the combined output,
+    # so the input token count isn't inflated N times for N parallel agents.
+    tracker.track(parts[1], "\n".join(results.values()))
     print(f"\n  ⏱ {time.time()-start:.1f}s total")
 
 
@@ -352,8 +354,9 @@ def _cmd_files(args, history, tracker, memory):
 
 
 # --- Command Registry ---
-# Maps command name to (handler, takes_args). Prefix-matched commands (like /save, /load)
-# are handled by matching the longest prefix.
+# Maps command name to handler. Every command is a single whitespace-delimited
+# token, so an exact match on the first token is sufficient and unambiguous
+# (e.g. "/file" vs "/files" are distinct tokens and never collide).
 
 COMMANDS = {
     "/help": _cmd_help,
@@ -387,26 +390,21 @@ COMMANDS = {
 
 
 def _handle_command(cmd: str, history: ConversationHistory, tracker: TokenTracker, memory: AgentMemory) -> bool:
-    """Handle a slash command using the command registry. Returns True if handled."""
-    # Split into command name and args
+    """Handle a slash command using the command registry. Returns True if handled.
+
+    Matching is by exact command token only. An unrecognized token (e.g. a typo
+    like "/models") is NOT handled here and falls through to the normal flow,
+    rather than being silently mis-routed to a similarly-named command.
+    """
     parts = cmd.split(" ", 1)
     cmd_name = parts[0]
     args = parts[1].strip() if len(parts) > 1 else ""
 
-    # Exact match first (e.g., /help, /agents)
-    if cmd_name in COMMANDS:
-        COMMANDS[cmd_name](args, history, tracker, memory)
-        return True
-
-    # Prefix match for commands that share prefixes (e.g., /file vs /files)
-    # Sort by length descending to match longest prefix first
-    for registered_cmd in sorted(COMMANDS.keys(), key=len, reverse=True):
-        if cmd.startswith(registered_cmd):
-            remaining = cmd[len(registered_cmd):].strip()
-            COMMANDS[registered_cmd](remaining, history, tracker, memory)
-            return True
-
-    return False
+    handler = COMMANDS.get(cmd_name)
+    if handler is None:
+        return False
+    handler(args, history, tracker, memory)
+    return True
 
 
 def _run_and_print(user_input: str, history: ConversationHistory, tracker: TokenTracker):
