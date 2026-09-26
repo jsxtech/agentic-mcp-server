@@ -58,7 +58,7 @@ class TokenTracker:
 
 
 def save_session(history: ConversationHistory, name: str = None) -> str:
-    SESSIONS_DIR.mkdir(exist_ok=True)
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     name = name or datetime.now().strftime("%Y%m%d_%H%M%S")
     # Sanitize name to prevent path traversal
     name = name.replace("/", "_").replace("\\", "_").replace("..", "_")
@@ -88,7 +88,7 @@ def list_sessions() -> list[str]:
 
 
 def export_session(history: ConversationHistory) -> str:
-    SESSIONS_DIR.mkdir(exist_ok=True)
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     name = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = SESSIONS_DIR / f"{name}.md"
     lines = [f"# Conversation — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"]
