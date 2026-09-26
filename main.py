@@ -29,7 +29,7 @@ def check_ollama_health() -> bool:
             print(f"⚠️  Model '{_config.MODEL_NAME}' not found. Available: {models}")
             return False
         return True
-    except (requests.ConnectionError, requests.Timeout, requests.JSONDecodeError, ValueError):
+    except (requests.ConnectionError, requests.Timeout, ValueError):
         return False
 
 
@@ -273,11 +273,13 @@ def _cmd_batch(args, history, tracker, memory):
     print(f"  Running {agent_name} on {len(tasks)} tasks...\n")
     start = time.time()
     results = run_batch(agent_name, tasks, history)
+    # run_batch returns either one result per task, or a single-element error
+    # list (e.g. unknown agent). Only map results to tasks 1:1 when the lengths
+    # match; otherwise track the error result without mis-associating it.
+    aligned = len(results) == len(tasks)
     for i, r in enumerate(results):
         print(f"━━━ Task {i+1} ━━━\n{r}\n")
-        # Only track if we have a corresponding task (batch may return error list shorter than tasks)
-        if i < len(tasks):
-            tracker.track(tasks[i], r)
+        tracker.track(tasks[i] if aligned else "", r)
     print(f"  ⏱ {time.time()-start:.1f}s total")
 
 
@@ -418,6 +420,30 @@ def _run_and_print(user_input: str, history: ConversationHistory, tracker: Token
     tracker.track(user_input, result)
 
 
+def _process_input(user_input: str, history: ConversationHistory, tracker: TokenTracker, memory: AgentMemory) -> bool:
+    """Process a single line of user input. Returns False when the REPL should exit.
+
+    All command dispatch and the normal multi-agent flow run inside one try/except
+    so that an LLM/network error (e.g. Ollama down) during ANY command — not just
+    the normal flow — is reported gracefully instead of crashing the REPL.
+    """
+    if not user_input:
+        return True
+    if user_input.lower() in ("quit", "exit"):
+        print("Goodbye!")
+        return False
+
+    try:
+        if user_input.startswith("/"):
+            if _handle_command(user_input, history, tracker, memory):
+                return True
+        # Normal multi-agent flow (also reached for a "/" input that isn't a command)
+        _run_and_print(user_input, history, tracker)
+    except Exception as e:
+        print(f"❌ Error: {e}\n   Make sure Ollama is running: ollama serve")
+    return True
+
+
 def run_cli():
     print("=" * 60)
     print("  Multi-Agent AI System (Local LLM via Ollama)")
@@ -441,20 +467,8 @@ def run_cli():
             print("\nGoodbye!")
             break
 
-        if not user_input:
-            continue
-        if user_input.lower() in ("quit", "exit"):
-            print("Goodbye!")
+        if not _process_input(user_input, history, tracker, memory):
             break
-        if user_input.startswith("/"):
-            if _handle_command(user_input, history, tracker, memory):
-                continue
-
-        # Normal multi-agent flow
-        try:
-            _run_and_print(user_input, history, tracker)
-        except Exception as e:
-            print(f"❌ Error: {e}\n   Make sure Ollama is running: ollama serve")
 
 
 def run_mcp_server(transport: str, host: str, port: int):
